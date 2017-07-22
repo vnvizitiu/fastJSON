@@ -470,6 +470,9 @@ namespace fastJSON
             if (conversionType == typeof(byte[]))
                 return Convert.FromBase64String((string)value);
 
+            if (conversionType == typeof(TimeSpan))
+                return new TimeSpan((long)value);
+
             return Convert.ChangeType(value, conversionType, CultureInfo.InvariantCulture);
         }
 
@@ -477,6 +480,11 @@ namespace fastJSON
         {
             //                   0123456789012345678 9012 9/3 0/4  1/5
             // datetime format = yyyy-MM-ddTHH:mm:ss .nnn  _   +   00:00
+
+            // ISO8601 roundtrip formats have 7 digits for ticks, and no space before the '+'
+            // datetime format = yyyy-MM-ddTHH:mm:ss .nnnnnnn  +   00:00  
+            // datetime format = yyyy-MM-ddTHH:mm:ss .nnnnnnn  Z  
+
             int year;
             int month;
             int day;
@@ -484,6 +492,7 @@ namespace fastJSON
             int min;
             int sec;
             int ms = 0;
+            int usTicks = 0; // ticks for xxx.x microseconds
             int th = 0;
             int tm = 0;
 
@@ -494,18 +503,47 @@ namespace fastJSON
             min = CreateInteger(value, 14, 2);
             sec = CreateInteger(value, 17, 2);
 
-            if (value.Length > 21 && value[19] == '.')
-                ms = CreateInteger(value, 20, 3);
             int p = 20;
-            if (ms > 0)
-                p = 24;
+
+            if (value.Length > 21 && value[19] == '.')
+            {
+                ms = CreateInteger(value, p, 3);
+                p = 23;
+
+                // handle 7 digit case
+                if (value.Length > 25 && char.IsDigit(value[p]))
+                {
+                    usTicks = CreateInteger(value, p, 4);
+                    p = 27;
+                }                
+            }
+
+            if (value[p] == 'Z')
+                // UTC
+                return CreateDateTimeOffset(year, month, day, hour, min, sec, ms, usTicks, TimeSpan.Zero);
+
+            if (value[p] == ' ')
+                ++p;
+
+            // +00:00
             th = CreateInteger(value, p + 1, 2);
             tm = CreateInteger(value, p + 1 + 2 + 1, 2);
 
             if (value[p] == '-')
                 th = -th;
 
-            return new DateTimeOffset(year, month, day, hour, min, sec, ms, new TimeSpan(th,tm,0));
+            return CreateDateTimeOffset(year, month, day, hour, min, sec, ms, usTicks, new TimeSpan(th, tm, 0));
+        }
+
+        private static DateTimeOffset CreateDateTimeOffset(
+            int year, int month, int day, int hour, int min, int sec, int milli, int extraTicks, TimeSpan offset)
+        {
+            var dt = new DateTimeOffset(year, month, day, hour, min, sec, milli, offset);
+
+            if (extraTicks > 0)
+                dt += TimeSpan.FromTicks(extraTicks);
+
+            return dt;
         }
 
         private bool IsNullable(Type t)
@@ -684,8 +722,8 @@ namespace fastJSON
 
                         switch (pi.Type)
                         {
-                            case myPropInfoType.Int: oset = (int)((long)v); break;
-                            case myPropInfoType.Long: oset = (long)v; break;
+                            case myPropInfoType.Int: oset = (int)AutoConv(v); break;
+                            case myPropInfoType.Long: oset = AutoConv(v); break;
                             case myPropInfoType.String: oset = (string)v; break;
                             case myPropInfoType.Bool: oset = (bool)v; break;
                             case myPropInfoType.DateTime: oset = CreateDateTime((string)v); break;
@@ -735,6 +773,23 @@ namespace fastJSON
             return o;
         }
 
+        private long AutoConv(object value)
+        {
+            //string s = value as string;
+            //if (s == null)
+            //    return (long)value;
+            //else
+            //    return CreateLong(s, 0, s.Length);
+
+            if (value is string)
+            {
+                string s = (string)value;
+                return CreateLong(s, 0, s.Length);
+            }
+            else
+                return (long)value;
+        }
+
         private StringDictionary CreateSD(Dictionary<string, object> d)
         {
             StringDictionary nv = new StringDictionary();
@@ -765,6 +820,29 @@ namespace fastJSON
                 if (t == typeof(Guid))
                     p.setter(obj, CreateGuid((string)o));
             }
+        }
+
+        private long CreateLong(string s, int index, int count)
+        {
+            long num = 0;
+            bool neg = false;
+            for (int x = 0; x < count; x++, index++)
+            {
+                char cc = s[index];
+
+                if (cc == '-')
+                    neg = true;
+                else if (cc == '+')
+                    neg = false;
+                else
+                {
+                    num *= 10;
+                    num += (int)(cc - '0');
+                }
+            }
+            if (neg) num = -num;
+
+            return num;
         }
 
         private int CreateInteger(string s, int index, int count)
@@ -810,6 +888,9 @@ namespace fastJSON
 
         private DateTime CreateDateTime(string value)
         {
+            if (value.Length < 19)
+                return DateTime.MinValue;
+
             bool utc = false;
             //                   0123456789012345678 9012 9/3
             // datetime format = yyyy-MM-ddTHH:mm:ss .nnn  Z
